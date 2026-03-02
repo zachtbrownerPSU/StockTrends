@@ -1,21 +1,21 @@
 import pandas as pd
-import yfinance as yf #Yahoo Finance API
+import yfinance as yf
 from sqlalchemy import create_engine
 import streamlit as st
 
-#Collect
-@st.cache_data #Tell streamlit to remember the result of the function the first time it is ran so it doesn't have to rerun
-def collect_data(tickers):
+# Collect
+@st.cache_data
+def collect_data(tickers, lookback):
     data = []
     for ticker in tickers:
-        df = yf.download(ticker, period = "7d", interval = "1h") #Downloads hourly data for the last 7 days
-        df.reset_index(inplace = True) #Resets index to turn Datetime into a column
+        df = yf.download(ticker, period=lookback, interval="1h") 
+        df.reset_index(inplace=True)
         df["ticker"] = ticker 
         data.append(df)
-    combined = pd.concat(data, ignore_index=True) #Combines data for all tickers into one data frame
+    combined = pd.concat(data, ignore_index=True)
     return combined
 
-#Clean
+# Clean
 def clean_data(df):
     df = df.reset_index()
     if isinstance(df.columns, pd.MultiIndex):
@@ -26,37 +26,103 @@ def clean_data(df):
         var_name="ticker",
         value_name="Close"
     )
-    df["ticker"] = df["ticker"].str.replace("_Close", "", regex=False) # Clean ticker names
+    df["ticker"] = df["ticker"].str.replace("_Close", "", regex=False)
     df["Datetime"] = pd.to_datetime(df["Datetime"])
-    df["Close"] = df["Close"].interpolate() # Interpolate missing Close values
-    df["Daily_Return"] = df.groupby("ticker")["Close"].pct_change() # Compute daily returns per ticker
+    df["Close"] = df["Close"].interpolate()
+    df["Daily_Return"] = df.groupby("ticker")["Close"].pct_change()
+
+    # Relative Strength Index
+    def compute_rsi(series, period=14):
+        delta = series.diff()
+        gain = (delta.where(delta > 0, 0))
+        loss = (-delta.where(delta < 0, 0))
+        avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+
+    df["RSI"] = df.groupby("ticker")["Close"].transform(lambda x: compute_rsi(x))
+    df["SMA_20"] = df.groupby("ticker")["Close"].transform(lambda x: x.rolling(window=20).mean())
+
     return df
 
-#Storage
-def save_db(df, table_name = "clean_data", db_url = "sqlite:///stock_data.db"):
+# Storage
+def save_db(df, table_name="clean_data", db_url="sqlite:///stock_data.db"):
     engine = create_engine(db_url)
-    df.to_sql(table_name, con = engine, if_exists = "replace", index = False)
+    df.to_sql(table_name, con=engine, if_exists="replace", index=False) 
 
-def read_db(table_name = "clean_data", db_url = "sqlite:///stock_data.db"):
+def read_db(table_name="clean_data", db_url="sqlite:///stock_data.db"):
     engine = create_engine(db_url)
-    return pd.read_sql(f"SELECT * FROM {table_name}", con=engine)
+    try:
+        return pd.read_sql(f"SELECT * FROM {table_name}", con=engine)
+    except:
+        return pd.DataFrame() # Returns empty dataframe if table doesn't exist yet
 
-#Dashboard
+# Dashboard
 def run_dashboard():
-    st.title("Stock Data Dashboard")
-    tickers = ["AAPL", "MSFT", "GOOGL"]
-    raw_df = collect_data(tickers) #Collect
-    clean_df = clean_data(raw_df) #Clean
-    save_db(clean_df) #Store
-    df = read_db() #Read
-    ticker = st.selectbox("Select Ticker", df["ticker"].unique()) #User chooses what ticker to view
-    filtered = df[df["ticker"] == ticker]
-    st.subheader("Stock Prices (Last 7 Days)")
-    st.line_chart(filtered, x = "Datetime", y = "Close")
-    st.subheader("Daily Returns")
-    st.bar_chart(filtered, x = "Datetime", y = "Daily_Return")
-    st.subheader("Data Preview")
-    st.dataframe(filtered.tail(10))
+    st.set_page_config(page_title="AlphaStream Insights", layout="wide")
+    st.title("Financial Dashboard")
+    
+    # Sidebar
+    with st.sidebar:
+        st.header("Settings")
+
+        lookback = st.selectbox("Select Lookback Period", ["7d", "14d", "28d"], index=2)
+        
+        if "ticker_list" not in st.session_state:
+            st.session_state.ticker_list = []
+        new_ticker = st.text_input("Add a Ticker").upper().strip()
+        
+        if st.button("Add to List"):
+            if new_ticker:
+                if new_ticker not in st.session_state.ticker_list:
+                    st.session_state.ticker_list.append(new_ticker)
+                    st.success(f"Added {new_ticker}")
+                else:
+                    st.info(f"{new_ticker} is already in the list.")
+            else:
+                st.error("Please enter a ticker symbol.")
+
+        if st.session_state.ticker_list:
+            tickers = st.multiselect(
+                "Select Tickers to Fetch", 
+                options=st.session_state.ticker_list, 
+                default=st.session_state.ticker_list
+            )
+            
+            if st.button("Fetch New Data"):
+                with st.spinner("Updating Database..."):
+                    raw_df = collect_data(tickers, lookback)
+                    if not raw_df.empty:
+                        clean_df = clean_data(raw_df)
+                        save_db(clean_df)
+                        st.success("Database Updated!")
+                    else:
+                        st.error("No data found for selected tickers.")
+
+            if st.button("Clear Ticker List"):
+                st.session_state.ticker_list = []
+                st.rerun()
+        else:
+            st.info("Your ticker list is empty. Add a symbol above to get started!")
+
+    # Layout
+    df = read_db()
+    if not df.empty:
+        selected_ticker = st.selectbox("View Analysis For:", df["ticker"].unique())
+        filtered = df[df["ticker"] == selected_ticker]
+
+        col1, col2, col3 = st.columns(3)
+        current_price = filtered["Close"].iloc[-1]
+        delta = filtered["Daily_Return"].iloc[-1]
+        
+        col1.metric("Current Price", f"${current_price:.2f}", f"{delta:.2%}")
+        col2.metric("RSI (14)", f"{filtered['RSI'].iloc[-1]:.2f}")
+        col3.metric(f"{lookback.upper()} High", f"${filtered['Close'].max():.2f}")
+
+        st.line_chart(filtered, x="Datetime", y=["Close", "SMA_20"])
+    else:
+        st.warning("No data in the database. Please add a ticker and fetch data from the sidebar.")
 
 if __name__ == "__main__":
     run_dashboard()
